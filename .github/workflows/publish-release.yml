@@ -1,0 +1,131 @@
+name: ASTROML Publish Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version (example: 5.1.6 — do not include v)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-publish:
+    name: Build and publish ASTROML release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate version
+        id: version
+        shell: bash
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Invalid version '$VERSION'. Enter a version like 5.1.6 without the v prefix." >&2
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout source
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+
+      - name: Setup Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Install dependencies
+        run: flutter pub get
+
+      - name: Configure release signing
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          if [ -n "$KEYSTORE_B64" ]; then
+            echo "$KEYSTORE_B64" | base64 -d > android/app/upload-keystore.jks
+            cat > android/key.properties <<EOF
+          storeFile=upload-keystore.jks
+          storePassword=$KEYSTORE_PASSWORD
+          keyAlias=$KEY_ALIAS
+          keyPassword=$KEY_PASSWORD
+          EOF
+          else
+            echo "No signing secrets set; release APKs will use debug signing."
+          fi
+
+      - name: Analyze
+        run: flutter analyze --no-fatal-infos
+
+      - name: Build ARM32 and ARM64 APKs
+        run: >-
+          flutter build apk --release --split-per-abi
+          --build-name=${{ steps.version.outputs.version }}
+          --build-number=${{ github.run_number }}
+
+      - name: Build universal APK
+        run: >-
+          flutter build apk --release
+          --build-name=${{ steps.version.outputs.version }}
+          --build-number=${{ github.run_number }}
+
+      - name: Prepare APK assets
+        shell: bash
+        run: |
+          OUT=build/app/outputs/flutter-apk
+          VERSION='${{ steps.version.outputs.version }}'
+          test -f "$OUT/app-armeabi-v7a-release.apk"
+          test -f "$OUT/app-arm64-v8a-release.apk"
+          test -f "$OUT/app-release.apk"
+          cp "$OUT/app-armeabi-v7a-release.apk" "$OUT/ASTROML-${VERSION}-arm32.apk"
+          cp "$OUT/app-arm64-v8a-release.apk" "$OUT/ASTROML-${VERSION}-arm64.apk"
+          cp "$OUT/app-release.apk" "$OUT/ASTROML-${VERSION}-universal.apk"
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ASTROML-${{ steps.version.outputs.version }}-APKs
+          path: build/app/outputs/flutter-apk/ASTROML-*.apk
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Create tag and publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: ${{ steps.version.outputs.version }}
+          target_commitish: ${{ github.event.repository.default_branch }}
+          body: |
+            ## ASTROML ${{ steps.version.outputs.version }}
+
+            Developer: **Astro Renz**
+
+            ### Downloads
+            - **ARM32** — 32-bit ARM devices.
+            - **ARM64** — 64-bit ARM devices.
+            - **Universal** — combined APK for supported ABIs.
+
+            ### What's New
+            Add release notes here after publishing. For up to two screenshots, use public HTTPS Markdown image links:
+            ![Screenshot 1](https://example.com/screenshot-1.png)
+            ![Screenshot 2](https://example.com/screenshot-2.png)
+          files: |
+            build/app/outputs/flutter-apk/ASTROML-${{ steps.version.outputs.version }}-arm32.apk
+            build/app/outputs/flutter-apk/ASTROML-${{ steps.version.outputs.version }}-arm64.apk
+            build/app/outputs/flutter-apk/ASTROML-${{ steps.version.outputs.version }}-universal.apk
+          fail_on_unmatched_files: true
+          generate_release_notes: true
