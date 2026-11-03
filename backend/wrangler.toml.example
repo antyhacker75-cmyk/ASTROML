@@ -1,0 +1,6 @@
+name = "astroml-feedback"
+main = "telegram-feedback-worker.js"
+compatibility_date = "2026-11-03"
+
+[vars]
+TELEGRAM_CHAT_ID = "REPLACE_WITH_YOUR_CHAT_ID"
