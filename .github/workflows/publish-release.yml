@@ -1,0 +1,197 @@
+name: ASTROML Publish Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version (example: 5.1.6; do not include v)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-publish:
+    name: Build and publish ASTROML release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate version
+        id: version
+        shell: bash
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          # Accept stable releases (5.2.3), beta releases (5.2.3-beta),
+          # and numbered beta builds (5.2.3-beta1, 5.2.3-beta2, ...).
+          if [[ ! "$VERSION" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)(-beta([0-9]+)?)?$ ]]; then
+            echo "Invalid version: $VERSION. Use 5.2.3, 5.2.3-beta, or 5.2.3-beta1." >&2
+            exit 1
+          fi
+          MAJOR="${BASH_REMATCH[1]}"
+          MINOR="${BASH_REMATCH[2]}"
+          PATCH="${BASH_REMATCH[3]}"
+          BETA_NUMBER="${BASH_REMATCH[5]:-0}"
+          if [[ "$VERSION" == *-beta* ]]; then
+            RELEASE_SUFFIX=$BETA_NUMBER
+          else
+            # Stable builds sort after beta builds of the same version.
+            RELEASE_SUFFIX=99
+          fi
+          BUILD_NUMBER=$((MAJOR * 10000000 + MINOR * 100000 + PATCH * 100 + RELEASE_SUFFIX))
+          if (( BUILD_NUMBER < 1 || BUILD_NUMBER > 2100000000 )); then
+            echo "Version produces an invalid Android versionCode." >&2
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+          echo "build_number=$BUILD_NUMBER" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout source
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Check whether release already exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          if gh release view "$TAG" --repo "$REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $TAG already exists. Choose a new version." >&2
+            exit 1
+          fi
+
+      - name: Setup Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Install dependencies
+        run: flutter pub get
+
+      - name: Configure release signing
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          if [ -z "$KEYSTORE_B64" ] || [ -z "$KEYSTORE_PASSWORD" ] || [ -z "$KEY_ALIAS" ] || [ -z "$KEY_PASSWORD" ]; then
+            echo "Missing Android release-signing secrets. Configure ANDROID_KEYSTORE_B64, ANDROID_KEYSTORE_PASSWORD, ANDROID_KEY_ALIAS, and ANDROID_KEY_PASSWORD. Refusing to publish a debug-signed APK." >&2
+            exit 1
+          fi
+          echo "$KEYSTORE_B64" | base64 -d > android/app/upload-keystore.jks
+          test -s android/app/upload-keystore.jks
+          cat > android/key.properties <<EOF_KEY
+          storeFile=upload-keystore.jks
+          storePassword=$KEYSTORE_PASSWORD
+          keyAlias=$KEY_ALIAS
+          keyPassword=$KEY_PASSWORD
+          EOF_KEY
+
+      - name: Analyze
+        run: flutter analyze --no-fatal-infos
+
+      - name: Build ARM32 and ARM64 APKs
+        run: >-
+          flutter build apk --release --split-per-abi
+          --build-name=${{ steps.version.outputs.version }}
+          --build-number=${{ steps.version.outputs.build_number }}
+
+      - name: Build universal APK
+        run: >-
+          flutter build apk --release
+          --build-name=${{ steps.version.outputs.version }}
+          --build-number=${{ steps.version.outputs.build_number }}
+
+      - name: Prepare release APKs
+        shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          OUT="build/app/outputs/flutter-apk"
+          test -f "$OUT/app-armeabi-v7a-release.apk"
+          test -f "$OUT/app-arm64-v8a-release.apk"
+          test -f "$OUT/app-release.apk"
+          cp "$OUT/app-armeabi-v7a-release.apk" "$OUT/ASTROML-${VERSION}-arm32.apk"
+          cp "$OUT/app-arm64-v8a-release.apk" "$OUT/ASTROML-${VERSION}-arm64.apk"
+          cp "$OUT/app-release.apk" "$OUT/ASTROML-${VERSION}-universal.apk"
+          for apk in "$OUT"/ASTROML-*.apk; do
+            "$ANDROID_HOME/build-tools/$(ls "$ANDROID_HOME/build-tools" | sort -V | tail -1)/apksigner" verify --verbose "$apk"
+          done
+          ls -lh "$OUT"/ASTROML-*.apk
+
+      - name: Upload APK build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ASTROML-${{ steps.version.outputs.version }}-APKs
+          path: build/app/outputs/flutter-apk/ASTROML-*.apk
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish GitHub Release and create version tag
+        uses: softprops/action-gh-release@v2
+        with:
+          token: ${{ github.token }}
+          tag_name: ${{ steps.version.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: ${{ steps.version.outputs.version }}
+          prerelease: ${{ contains(steps.version.outputs.version, '-beta') }}
+          body: |
+            ## ASTROML ${{ steps.version.outputs.version }}
+
+            Developer: **Astro Renz**
+
+            ### Downloads
+            - **ARM32** — for 32-bit ARM devices.
+            - **ARM64** — for 64-bit ARM devices.
+            - **Universal** — APK containing the supported target ABIs.
+
+            ### Release notes and screenshots
+            Add release notes below. To display up to two screenshots in the app's update dialog, add public HTTPS image links using Markdown:
+            `![Screenshot 1](https://example.com/screenshot-1.png)`
+            `![Screenshot 2](https://example.com/screenshot-2.png)`
+          files: |
+            build/app/outputs/flutter-apk/ASTROML-${{ steps.version.outputs.version }}-arm32.apk
+            build/app/outputs/flutter-apk/ASTROML-${{ steps.version.outputs.version }}-arm64.apk
+            build/app/outputs/flutter-apk/ASTROML-${{ steps.version.outputs.version }}-universal.apk
+          fail_on_unmatched_files: true
+          generate_release_notes: true
+
+      - name: Send ASTROML update push notification
+        if: success()
+        env:
+          FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          if [ -z "$FIREBASE_SERVICE_ACCOUNT" ]; then
+            echo "FIREBASE_SERVICE_ACCOUNT secret is not configured; skipping FCM notification."
+            exit 0
+          fi
+          python -m pip install --quiet firebase-admin
+          printf '%s' "$FIREBASE_SERVICE_ACCOUNT" > "$RUNNER_TEMP/firebase-service-account.json"
+          python - <<'PY'
+          import os, firebase_admin
+          from firebase_admin import credentials, messaging
+          cred = credentials.Certificate(os.path.join(os.environ['RUNNER_TEMP'], 'firebase-service-account.json'))
+          firebase_admin.initialize_app(cred)
+          version = os.environ['VERSION']
+          messaging.send(messaging.Message(
+              topic='astroml_updates',
+              notification=messaging.Notification(
+                  title='ASTROML update available',
+                  body=f'Version {version} is ready. Tap to view release notes.'),
+              data={'type':'astroml_update','version':version},
+              android=messaging.AndroidConfig(priority='high')))
+          PY
+          rm -f "$RUNNER_TEMP/firebase-service-account.json"
