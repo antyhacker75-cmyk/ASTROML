@@ -1,0 +1,158 @@
+import 'dart:io';
+
+import 'package:flutter/services.dart';
+import 'package:path_provider/path_provider.dart';
+
+import '../models/models.dart';
+
+class DownloadResult {
+  final bool ok;
+  final String? error;
+
+  const DownloadResult({required this.ok, this.error});
+}
+
+class EngineService {
+  EngineService._();
+
+  static const _channel = MethodChannel('com.astroml.dev/engine');
+  static const _lifecycleChannel = EventChannel('com.astroml.dev/lifecycle');
+  static const _downloadProgressChannel = EventChannel('com.astroml.dev/download_progress');
+
+  static Stream<Map<String, dynamic>> get downloadProgress =>
+      _downloadProgressChannel.receiveBroadcastStream().map((event) =>
+          Map<String, dynamic>.from(event as Map));
+
+  static Stream<String> get onResume => _lifecycleChannel
+      .receiveBroadcastStream()
+      .map((e) => e as String);
+
+  static Future<GameTarget?> findGame() async {
+    final result =
+        await _channel.invokeMethod<Map<dynamic, dynamic>>('findGame');
+    return result == null ? null : GameTarget.fromMap(result);
+  }
+
+  static Future<bool> storageGranted() async {
+    final result = await _channel.invokeMethod<bool>('storageGranted');
+    return result ?? false;
+  }
+
+  static Future<void> openStorageSettings() async {
+    await _channel.invokeMethod<void>('openStorageSettings');
+  }
+
+  static Future<String> shizukuState() async {
+    final result = await _channel.invokeMethod<String>('shizukuState');
+    return result ?? 'unavailable';
+  }
+
+  static Future<void> requestShizukuPermission() async {
+    await _channel.invokeMethod<void>('requestShizukuPermission');
+  }
+
+  static Future<void> bindShizuku() async {
+    await _channel.invokeMethod<void>('bindShizuku');
+  }
+
+  static Future<void> setNotificationSettings({required bool autoDismiss, required int seconds}) async {
+    try {
+      await _channel.invokeMethod<void>('setNotificationSettings', {
+        'autoDismiss': autoDismiss, 'seconds': seconds,
+      });
+    } catch (_) {}
+  }
+
+  static Future<void> updateInjectionNotification({required String title, required String message, required int progress, required String image, bool ongoing = true, int? notificationId}) async {
+    try {
+      await _channel.invokeMethod<void>('updateInjectionNotification', {
+        'title': title, 'message': message, 'progress': progress < 0 ? -1 : progress.clamp(0, 100).toInt(),
+        'image': image, 'ongoing': ongoing, 'notificationId': notificationId ?? (title.hashCode & 0x7fffffff),
+      });
+    } catch (_) {}
+  }
+
+  static Future<void> startBackgroundWork() async {
+    try { await _channel.invokeMethod<void>('startBackgroundWork'); } catch (_) {}
+  }
+
+  static Future<void> stopBackgroundWork() async {
+    try { await _channel.invokeMethod<void>('stopBackgroundWork'); } catch (_) {}
+  }
+
+  static Future<DownloadResult> downloadFile(String url, String path) async {
+    try {
+      final result = await _channel
+          .invokeMethod<bool>('downloadFile', {'url': url, 'path': path})
+          .timeout(const Duration(minutes: 15));
+      if (result == true) {
+        return const DownloadResult(ok: true);
+      }
+      return const DownloadResult(ok: false, error: 'Native download returned false');
+    } on PlatformException catch (e) {
+      return DownloadResult(ok: false, error: e.message);
+    } catch (e) {
+      return DownloadResult(ok: false, error: e.toString());
+    }
+  }
+
+  static Future<DownloadResult> unzip(String source, String target) async {
+    try {
+      final result = await _channel
+          .invokeMethod<bool>(
+            'unzip',
+            {'source': source, 'target': target},
+          )
+          .timeout(const Duration(minutes: 15));
+      if (result == true) {
+        return const DownloadResult(ok: true);
+      }
+      return const DownloadResult(ok: false, error: 'Native unzip returned false');
+    } on PlatformException catch (e) {
+      return DownloadResult(ok: false, error: e.message);
+    } catch (e) {
+      return DownloadResult(ok: false, error: e.toString());
+    }
+  }
+
+  static Future<bool> deleteFolder(String path) async {
+    final result = await _channel.invokeMethod<bool>(
+      'deleteFolder',
+      {'path': path},
+    );
+    return result ?? false;
+  }
+
+  static Future<List<String?>> sha256Files(List<String> paths) async {
+    if (paths.isEmpty) return [];
+    final result = await _channel
+        .invokeMethod<List<dynamic>>('sha256Files', {'paths': paths})
+        .timeout(const Duration(minutes: 2));
+    return result?.map((e) => e as String?).toList() ?? List.filled(paths.length, null);
+  }
+
+  static Future<List<(String, String)>> hashZipEntries(String path) async {
+    final result = await _channel.invokeMethod<List<dynamic>>(
+      'hashZipEntries',
+      {'path': path},
+    );
+    return (result ?? const []).map((e) {
+      final pair = e as List<dynamic>;
+      return (pair[0] as String, pair[1] as String);
+    }).toList();
+  }
+
+  static Future<void> clearRepairMarkers(
+      String assetsDir, String dataDir) async {
+    await _channel.invokeMethod<void>(
+      'clearRepairMarkers',
+      {'assetsDir': assetsDir, 'dataDir': dataDir},
+    );
+  }
+
+  static Future<Directory> cacheDir() async {
+    final base = await getExternalStorageDirectory();
+    return Directory(
+        '${base?.path ?? '/storage/emulated/0/Android/data/com.astroml.dev/files'}/skin_cache');
+  }
+}
